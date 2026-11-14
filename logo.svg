@@ -1,0 +1,28 @@
+<svg width="32" height="32" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+   <defs>
+     <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+       <feGaussianBlur stdDeviation="0.6" result="blur"/>
+       <feMerge>
+         <feMergeNode in="blur"/>
+         <feMergeNode in="SourceGraphic"/>
+       </feMerge>
+     </filter>
+     <radialGradient id="sphereGrad" cx="16" cy="16" r="8" gradientUnits="userSpaceOnUse">
+       <stop offset="0%" stop-color="#6fd1ff"/>
+       <stop offset="55%" stop-color="#2389d6"/>
+       <stop offset="100%" stop-color="#0a4f96"/>
+     </radialGradient>
+   </defs>
+   <!-- 中心蓝色球体 -->
+   <circle cx="16" cy="16" r="7.6" fill="url(#sphereGrad)"/>
+   <!-- 球体高光 -->
+   <ellipse cx="13.8" cy="13.2" rx="1.6" ry="0.7" fill="#ffffff" opacity="0.45"/>
+   <!-- 大扁圆线圈 -->
+   <ellipse cx="16" cy="16" rx="12.4" ry="4.6"
+            fill="none" stroke="#59d8ff" stroke-width="0.55"
+            transform="rotate(-20 16 16)" filter="url(#glow)"/>
+   <!-- 小扁圆线圈 -->
+   <ellipse cx="16" cy="16" rx="9.8" ry="3.6"
+            fill="none" stroke="#2fb6ff" stroke-width="0.45"
+            transform="rotate(25 16 16)" filter="url(#glow)"/>
+ </svg>
