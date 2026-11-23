@@ -1,0 +1,416 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+import "@openzeppelin/contracts@4.9.3/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts@4.9.3/access/Ownable.sol";
+import "@openzeppelin/contracts@4.9.3/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts@4.9.3/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts@4.9.3/token/ERC20/IERC20.sol";
+
+interface IPancakeRouter {
+    function addLiquidity(
+        address tokenA, address tokenB,
+        uint amountADesired, uint amountBDesired,
+        uint amountAMin, uint amountBMin,
+        address to, uint deadline
+    ) external returns (uint amountA, uint amountB, uint liquidity);
+    function factory() external pure returns (address);
+    function swapExactTokensForTokens(
+        uint amountIn, uint amountOutMin,
+        address[] calldata path,
+        address to, uint deadline
+    ) external returns (uint[] memory amounts);
+}
+
+interface IPancakeFactory {
+    function getPair(address tokenA, address tokenB) external view returns (address);
+}
+
+interface IPancakePair {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function factory() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+}
+
+contract BSTAR is ERC20, Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    uint256 public constant TOTAL_SUPPLY = 2_100_000_000 * 1e18;
+    uint256 public constant TOKENS_PER_USDT = 10000 * 1e18;
+    uint256 public constant OPEN_THRESHOLD = 20000 * 1e18;
+
+    // ===== LP 55%（原50% + 多余5%）=====
+    uint256 public constant LP_RATE = 55;
+    uint256 public constant OPS_RATE = 40;
+
+    // ===== 无推荐人 fallback 5% =====
+    uint256 public constant REF_RATE = 5;
+
+    // ===== 二代推荐奖励 =====
+    uint256 public constant GEN1_RATE = 3;   // 直推 3%
+    uint256 public constant GEN2_RATE = 2;   // 间推 2%
+
+    // ===== 税收 =====
+    uint256 public constant BUY_TAX_RATE = 100;      // 买 1%
+    uint256 public constant SELL_TAX_RATE = 500;     // 卖 5%
+
+    uint256 public constant BURN_RATE_BUY = 50;      // 买销毁 0.5%
+    uint256 public constant BURN_RATE_SELL = 200;    // 卖销毁 2%
+
+    uint256 public constant USDT_DECIMALS = 1e18;
+
+    address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
+    address public constant PANCAKE_ROUTER = 0x10ED43C718714eb63d5aA57B78B54704E256024E;
+
+    address public usdt;
+    address public router;
+    address public lpPair;
+    address public opsWallet;
+
+    bool public lpOpened;
+    uint256 public totalMintedUSDT;
+    uint256 public pendingLP_USDT;
+    uint256 public totalLPAddedUSDT;
+    uint256 public totalLPAddedTokens;
+
+    uint256 public totalTaxToMintPool;
+
+    string public officialWebsite;
+    string public contractURI;
+
+    mapping(address => bool) public isPair;
+    mapping(address => bool) public isExcludedFromTax;
+    mapping(address => address) public referrer;
+    mapping(address => bool) public hasBound;
+
+    mapping(address => address[]) public children;
+    mapping(address => uint256) public childCount;
+
+    mapping(address => uint256) public directPerformance;
+    mapping(address => uint256) public teamPerformance;
+    mapping(address => uint256) public totalRefReward;
+
+    bool private inSwap;
+
+    event Minted(address user, uint256 usdtAmount, uint256 tokenAmount, address inviter);
+    event LPCreated(uint256 tokenAmount, uint256 usdtAmount, uint256 lpAmount);
+    event LPAdded(uint256 tokenAmount, uint256 usdtAmount, uint256 lpAmount);
+    event TaxToMintPool(address indexed from, uint256 amount);
+    event ReferrerBound(address indexed user, address indexed inviter);
+    event RefRewardPaid(address indexed user, address indexed referrer, uint256 amount);
+
+    constructor(
+        address _usdt,
+        address _router,
+        address _opsWallet,
+        string memory _website,
+        string memory _contractURI_
+    ) ERC20("BSTAR", "BSTAR") {
+        require(_usdt != address(0) && _opsWallet != address(0), "zero addr");
+        usdt = _usdt;
+        router = _router != address(0) ? _router : PANCAKE_ROUTER;
+        opsWallet = _opsWallet;
+        officialWebsite = _website;
+        contractURI = _contractURI_;
+
+        _mint(address(this), TOTAL_SUPPLY);
+        isExcludedFromTax[address(this)] = true;
+        isExcludedFromTax[msg.sender] = true;
+        isExcludedFromTax[DEAD] = true;
+        isExcludedFromTax[opsWallet] = true;
+        isExcludedFromTax[router] = true;
+    }
+
+    function _isTaxablePair(address addr) internal view returns (bool) {
+        if (isPair[addr]) return true;
+        if (addr == address(0) || addr == router) return false;
+
+        address factoryAddr;
+        address t0;
+        address t1;
+        assembly {
+            let ptr := mload(0x40)
+            mstore(ptr, 0x45e5c2c0)
+            let result := staticcall(3000, addr, ptr, 0x04, 0x40, 0x20)
+            if iszero(result) { return(0, 0) }
+            factoryAddr := mload(0x40)
+
+            mstore(ptr, 0x0dfe1681)
+            result := staticcall(3000, addr, ptr, 0x04, 0x40, 0x20)
+            if iszero(result) { return(0, 0) }
+            t0 := mload(0x40)
+
+            mstore(ptr, 0xd21220a7)
+            result := staticcall(3000, addr, ptr, 0x04, 0x40, 0x20)
+            if iszero(result) { return(0, 0) }
+            t1 := mload(0x40)
+        }
+
+        if (factoryAddr != IPancakeRouter(router).factory()) return false;
+        if (t0 != address(this) && t1 != address(this)) return false;
+        return true;
+    }
+
+    function _approveUSDT(address spender, uint256 amount) internal {
+        IERC20(usdt).safeApprove(spender, 0);
+        if (amount > 0) IERC20(usdt).safeApprove(spender, amount);
+    }
+
+    function _approveSelf(address spender, uint256 amount) internal {
+        _approve(address(this), spender, 0);
+        if (amount > 0) _approve(address(this), spender, amount);
+    }
+
+    function mint(uint256 usdtAmount, address inviter) external nonReentrant {
+        require(usdtAmount > 0, "amount = 0");
+
+        if (!hasBound[msg.sender] && inviter != address(0) && inviter != msg.sender) {
+            referrer[msg.sender] = inviter;
+            hasBound[msg.sender] = true;
+            children[inviter].push(msg.sender);
+            childCount[inviter]++;
+            emit ReferrerBound(msg.sender, inviter);
+        }
+
+        IERC20(usdt).safeTransferFrom(msg.sender, address(this), usdtAmount);
+
+        uint256 tokenAmount;
+        if (!lpOpened) {
+            tokenAmount = usdtAmount * TOKENS_PER_USDT / USDT_DECIMALS;
+        } else {
+            uint256 price = getMarketPrice();
+            require(price > 0, "bad price");
+            tokenAmount = usdtAmount * 1e18 / price;
+        }
+        require(balanceOf(address(this)) >= tokenAmount, "insufficient token pool");
+        _transfer(address(this), msg.sender, tokenAmount);
+
+        uint256 toLP = usdtAmount * LP_RATE / 100;
+        pendingLP_USDT += toLP;
+
+        uint256 toOps = usdtAmount * OPS_RATE / 100;
+        IERC20(usdt).safeTransfer(opsWallet, toOps);
+
+        address gen1 = referrer[msg.sender];
+        if (gen1 != address(0)) {
+            uint256 gen1Reward = usdtAmount * GEN1_RATE / 100;
+            IERC20(usdt).safeTransfer(gen1, gen1Reward);
+            emit RefRewardPaid(msg.sender, gen1, gen1Reward);
+
+            directPerformance[gen1] += usdtAmount;
+            teamPerformance[gen1] += usdtAmount;
+            totalRefReward[gen1] += gen1Reward;
+
+            address gen2 = referrer[gen1];
+            if (gen2 != address(0)) {
+                uint256 gen2Reward = usdtAmount * GEN2_RATE / 100;
+                IERC20(usdt).safeTransfer(gen2, gen2Reward);
+                emit RefRewardPaid(msg.sender, gen2, gen2Reward);
+
+                teamPerformance[gen2] += usdtAmount;
+                totalRefReward[gen2] += gen2Reward;
+            } else {
+                uint256 gen2Reward = usdtAmount * GEN2_RATE / 100;
+                IERC20(usdt).safeTransfer(opsWallet, gen2Reward);
+            }
+        } else {
+            uint256 toRef = usdtAmount * REF_RATE / 100;
+            IERC20(usdt).safeTransfer(opsWallet, toRef);
+        }
+
+        totalMintedUSDT += usdtAmount;
+        emit Minted(msg.sender, usdtAmount, tokenAmount, gen1);
+
+        if (!lpOpened) {
+            if (pendingLP_USDT >= OPEN_THRESHOLD) {
+                // ===== 修改点：拆分阈值部分与超出部分 =====
+                uint256 excess = pendingLP_USDT - OPEN_THRESHOLD;
+                pendingLP_USDT = OPEN_THRESHOLD;
+                _openLP();
+                if (excess > 0) {
+                    pendingLP_USDT = excess;
+                    _autoAddLP();
+                }
+            }
+        } else {
+            _autoAddLP();
+        }
+    }
+
+    function _openLP() internal {
+        require(!lpOpened, "already open");
+        require(pendingLP_USDT > 0, "no LP fund");
+
+        // ===== 修改点：固定用 OPEN_THRESHOLD 开池，不用全量 pending =====
+        uint256 usdtToAdd = OPEN_THRESHOLD;
+        uint256 price = getMarketPrice();
+        require(price > 0, "bad price");
+        uint256 tokensToAdd = usdtToAdd * 1e18 / price;
+
+        require(balanceOf(address(this)) >= tokensToAdd, "not enough token for LP");
+
+        _approveUSDT(router, usdtToAdd);
+        _approveSelf(router, tokensToAdd);
+
+        (uint256 usedToken, uint256 usedUSDT, uint256 lpAmount) = IPancakeRouter(router).addLiquidity(
+            address(this), usdt, tokensToAdd, usdtToAdd, 0, 0, DEAD, block.timestamp
+        );
+
+        address pair = IPancakeFactory(IPancakeRouter(router).factory()).getPair(address(this), usdt);
+        require(pair != address(0), "pair not created");
+        lpPair = pair;
+        isPair[pair] = true;
+        lpOpened = true;
+
+        totalLPAddedUSDT += usedUSDT;
+        totalLPAddedTokens += usedToken;
+
+        // 如果实际消耗少于阈值（滑点/最小量），差额退回 pending
+        if (usdtToAdd > usedUSDT) {
+            pendingLP_USDT += usdtToAdd - usedUSDT;
+        }
+
+        emit LPCreated(usedToken, usedUSDT, lpAmount);
+    }
+
+    function _autoAddLP() internal {
+        if (!lpOpened) return;
+        if (pendingLP_USDT == 0) return;
+
+        uint256 usdtToAdd = pendingLP_USDT;
+        uint256 price = getMarketPrice();
+        if (price == 0) return;
+        uint256 tokensToAdd = usdtToAdd * 1e18 / price;
+
+        if (balanceOf(address(this)) < tokensToAdd) return;
+
+        pendingLP_USDT = 0;
+        _approveUSDT(router, usdtToAdd);
+        _approveSelf(router, tokensToAdd);
+
+        try IPancakeRouter(router).addLiquidity(
+            address(this), usdt, tokensToAdd, usdtToAdd, 0, 0, DEAD, block.timestamp
+        ) returns (uint256 usedToken, uint256 usedUSDT, uint256 lpAmount) {
+            totalLPAddedUSDT += usedUSDT;
+            totalLPAddedTokens += usedToken;
+            if (usdtToAdd > usedUSDT) pendingLP_USDT += usdtToAdd - usedUSDT;
+            emit LPAdded(usedToken, usedUSDT, lpAmount);
+        } catch {
+            pendingLP_USDT += usdtToAdd;
+        }
+    }
+
+    function addLiquidityManual() external nonReentrant {
+        require(lpOpened, "LP not open");
+        _autoAddLP();
+    }
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (inSwap) {
+            super._transfer(from, to, amount);
+            return;
+        }
+
+        if (!lpOpened && _isTaxablePair(to)) {
+            revert("add liquidity locked: LP not open");
+        }
+
+        if (lpOpened && (_isTaxablePair(from) || _isTaxablePair(to))) {
+            if (!isExcludedFromTax[from] && !isExcludedFromTax[to]) {
+
+                bool isSell = _isTaxablePair(to);
+                bool isBuy  = _isTaxablePair(from);
+
+                uint256 taxRate;
+                uint256 burnRate;
+
+                if (isBuy) {
+                    taxRate = BUY_TAX_RATE;
+                    burnRate = BURN_RATE_BUY;
+                } else if (isSell) {
+                    taxRate = SELL_TAX_RATE;
+                    burnRate = BURN_RATE_SELL;
+                } else {
+                    taxRate = 0;
+                    burnRate = 0;
+                }
+
+                if (taxRate > 0) {
+                    uint256 tax = amount * taxRate / 10000;
+                    uint256 burnAmount = amount * burnRate / 10000;
+                    uint256 mintPoolAmount = tax - burnAmount;
+
+                    if (burnAmount > 0) {
+                        super._transfer(from, DEAD, burnAmount);
+                    }
+
+                    if (mintPoolAmount > 0) {
+                        super._transfer(from, address(this), mintPoolAmount);
+                        totalTaxToMintPool += mintPoolAmount;
+                        emit TaxToMintPool(from, mintPoolAmount);
+                    }
+
+                    super._transfer(from, to, amount - tax);
+                    return;
+                }
+            }
+        }
+
+        super._transfer(from, to, amount);
+    }
+
+    function getMarketPrice() public view returns (uint256) {
+        if (lpPair == address(0)) return 1e18 / 10000;
+        (uint256 r0, uint256 r1,) = IPancakePair(lpPair).getReserves();
+        if (r0 == 0 || r1 == 0) return 1e18 / 10000;
+        address t0 = IPancakePair(lpPair).token0();
+        if (t0 == address(this)) {
+            return r1 * 1e18 / r0;
+        } else {
+            return r0 * 1e18 / r1;
+        }
+    }
+
+    // ===== Owner 管理 =====
+    function setPair(address pair, bool status) external onlyOwner { isPair[pair] = status; }
+    function setTaxExcluded(address account, bool status) external onlyOwner { isExcludedFromTax[account] = status; }
+    function setOfficialWebsite(string memory _website) external onlyOwner { officialWebsite = _website; }
+    function setContractURI(string memory _uri) external onlyOwner { contractURI = _uri; }
+
+    // ===== 查询 =====
+    function getLPStatus() external view returns (
+        bool opened, uint256 pendingUSDT, uint256 totalAddedUSDT, uint256 totalAddedTokens, uint256 threshold
+    ) {
+        return (lpOpened, pendingLP_USDT, totalLPAddedUSDT, totalLPAddedTokens, OPEN_THRESHOLD);
+    }
+
+    function mintPoolRemaining() external view returns (uint256) {
+        return balanceOf(address(this));
+    }
+
+    function getDirectChildren(address parent, uint256 offset, uint256 limit) external view returns (address[] memory) {
+        address[] storage all = children[parent];
+        uint256 len = all.length;
+        if (offset >= len) return new address[](0);
+        uint256 end = offset + limit;
+        if (end > len) end = len;
+        address[] memory result = new address[](end - offset);
+        for (uint256 i = offset; i < end; i++) {
+            result[i - offset] = all[i];
+        }
+        return result;
+    }
+
+    function getDirectPerformance(address user) external view returns (uint256) {
+        return directPerformance[user];
+    }
+
+    function getTeamPerformance(address user) external view returns (uint256) {
+        return teamPerformance[user];
+    }
+
+    function getTotalRefReward(address user) external view returns (uint256) {
+        return totalRefReward[user];
+    }
+}
